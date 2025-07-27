@@ -104,13 +104,26 @@ TARGET_ATTACK_LABELS_STR_GRANULAR = GRANULAR_HARMONIZED_LABELS # Or a subset of 
 
 # Hyperparameter Grids (can also be here or in main evaluation files)
 PARAM_GRIDS = {
+    # In utilis/constants.py
     'Logistic Regression': {
-        'C': [0.1, 1], 'penalty': ['l2'], 'solver': ['saga'], 'max_iter': [5000, 10000],'tol': [ 1e-2]
+        'C': [0.01, 1], # Fewer C values
+        'penalty': ['l2'], # Focus on l2 first, or just one if time is critical
+        'solver': ['saga'],
+        'max_iter': [5000, 10000], # Significantly reduced max_iter
+        'tol': [ 0.005] # Increased tolerance
     },
     'Random Forest': {
-        'n_estimators': [50, 100], 'max_features': ['sqrt'], 'min_samples_leaf': [1, 2], 'min_samples_split': [2, 5],
+        'n_estimators': [80], # Reduced search space, consider even smaller like [20, 50] for HPO
+        'max_features': ['sqrt'],
+        'min_samples_leaf': [1, 2, 4],
+        'min_samples_split': [2, 5, 10],
+        'max_depth': [20, 30, 40] # Add max_depth to control tree depth
     },
     'XGBoost': {
-        'n_estimators': [50, 100], 'learning_rate': [0.1], 'max_depth': [3, 5], 'subsample': [0.8, 1.0], 'colsample_bytree': [0.8, 1.0],
+        'n_estimators': [100,200],
+        'learning_rate': [0.05, 0.1],
+        'max_depth': [3, 5, 7],
+        'subsample': [0.7, 0.9],
+        'colsample_bytree': [0.7, 0.9]
     }
 }
