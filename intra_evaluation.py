@@ -326,8 +326,6 @@ def run_intra_dataset_evaluation(
             all_intra_results[dataset_name] = {"Error": "Single Class in Combined HPO Subsample"}
             continue
 
-         
-        
 
         classes_in_hpo_train = np.unique(y_train_combined_broad_hpo)
         class_weights_array = compute_class_weight(
@@ -432,9 +430,37 @@ def run_intra_dataset_evaluation(
             # Get the best model found by GridSearchCV
             best_model = search.best_estimator_
 
+            # NEW: Apply Benign Downsampling to the FULL training data before final model fit
+            # This is crucial because the best_model from HPO is refitted on the full training data.
+            DOWNSAMPLE_BENIGN_RATIO_FINAL_TRAIN = 1.0 # Example: 1:1 ratio for final model training
+            X_final_train, y_final_train = downsample_benign_data(
+                X_train_combined_hpo_source, # Use the full scaled training data (before HPO subsampling)
+                y_train_combined_broad, # Use the full training labels
+                broad_label_encoder,
+                ratio=DOWNSAMPLE_BENIGN_RATIO_FINAL_TRAIN
+            )
+            print(f"Final training data shape after downsampling: {X_final_train.shape}")
+
+            # Refit the best model on the downsampled full training data
+            # This ensures the model used for overall and per-day evaluation is trained on downsampled data
+            final_model_sample_weights = np.array([class_weights_dict[label] for label in y_final_train]) # Use weights from HPO
+            
+            # Check if the model has a 'fit' method and refit it
+            if hasattr(best_model, 'fit'):
+                print(f"Refitting {model_name} on downsampled full training data...")
+                best_model.fit(X_final_train, y_final_train, sample_weight=final_model_sample_weights)
+                print("Refitting complete.")
+            else:
+                print(f"Warning: {model_name} does not have a 'fit' method. Skipping refitting on downsampled data.")
+
+            # --- Overall Evaluation on Combined Test Set ---
+            # This section runs for both loaded and newly trained models
+            # Get the model to use for evaluation (either loaded or newly trained)
+            model_for_eval = best_model # Use the best_model that was just trained/refitted
+
     
             # --- Evaluation of Generalizable Model on Overall Test Set ---
-            print(f"\n--- Evaluation of Optimized {model_name} on Overall Test Set ({dataset_name}) ---")
+            print(f"\n--- Overall Evaluation of Optimized {model_name} on Overall Test Set ({dataset_name}) ---")
             y_pred_overall = best_model.predict(X_test_combined_scaled_np)
             y_proba_overall = best_model.predict_proba(X_test_combined_scaled_np)
 
@@ -531,7 +557,7 @@ def run_intra_dataset_evaluation(
             
 
 
-                # --- Per-Day Evaluation Loop ---
+            # --- Per-Day Evaluation Loop ---
             # This loop must run regardless of whether the model was trained or loaded
             # The 'model_for_per_day_eval' will correctly point to the trained or loaded model
             print(f"\n--- Evaluating Generalizable Model on Individual Daily Test Sets for {dataset_name} ---")
