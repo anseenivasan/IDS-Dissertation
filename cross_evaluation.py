@@ -36,12 +36,8 @@ from sklearn.utils.class_weight import compute_class_weight # NEW: Import for cl
 # Import from   utils module
 from utilis.Data_loader import load_and_align_all_data # This loads all data and performs initial alignment/encoding
 from utilis.metrics_helpers import calculate_specificity,_roc_auc_scorer_wrapper, get_scoring_metrics
-from utilis.constants import (
-    DATASET_PATHS, 
-    PARAM_GRIDS, 
-    TARGET_ATTACK_LABELS_STR_BROAD, 
-    BROAD_MAPPING # Used for mapping granular to broad labels
-)
+from utilis.constants import  PARAM_GRIDS
+
 
 
 # NEW CONSTANTS FOR SAVING/LOADING
@@ -49,76 +45,79 @@ from utilis.constants import (
 CROSS_MODELS_DIR = 'saved_cross_models'
 CROSS_RESULTS_DIR = 'saved_cross_results'
 
-def downsample_benign_data(X, y, broad_label_encoder, ratio=1.0, random_state=42):
+
+
+def rebalance_attacks(
+    X, y, broad_label_encoder,
+    min_per_attack=2000,
+    max_per_attack=50000,
+    benign_ratio=1.0,
+    random_state=42
+):
     """
-    Downsamples the 'Benign' class in the training data.
-    Args:
-        X (np.ndarray): Features (scaled, potentially PCA-transformed).
-        y (pd.Series or np.ndarray): Broad labels.
-        broad_label_encoder (LabelEncoder): Fitted LabelEncoder for broad labels.
-        ratio (float): Ratio of benign samples to total attack samples (e.g., 1.0 for 1:1).
-        random_state (int): Random state for reproducibility.
-    Returns:
-        tuple: (X_resampled, y_resampled)
+    Rebalances the dataset by over/under-sampling attack classes and adjusting the benign class.
     """
-    print(f"  Applying Benign downsampling with ratio: {ratio}...")
+    print(f"Applying rebalancing with min/max per attack: {min_per_attack}/{max_per_attack} and benign_ratio: {benign_ratio}")
     
-    # Ensure y is a Pandas Series for easy filtering and sampling
-    if not isinstance(y, pd.Series):
-        y_series = pd.Series(y)
-    else:
-        y_series = y.copy() # Use .copy() to avoid SettingWithCopyWarning if y was a view
-    
-    # CRITICAL FIX: Reset the index of y_series to align with the new DataFrame X_df
-    y_series = y_series.reset_index(drop=True) # <--- ADD THIS LINE
-
-    benign_encoded_id = broad_label_encoder.transform(['Benign'])[0]
-
-    print(f"  DEBUG (downsample): Benign encoded ID: {benign_encoded_id}")
-    print(f"  DEBUG (downsample): y_series dtype: {y_series.dtype}")
-    print(f"  DEBUG (downsample): y_series value_counts BEFORE filtering:\n{y_series.value_counts()}")
-
-    # Convert X to DataFrame temporarily to keep labels aligned during filtering/sampling
     X_df = pd.DataFrame(X)
-    X_df['y'] = y_series # This assignment should now be perfectly aligned by position
+    y_series = pd.Series(y, name="y").reset_index(drop=True)
+    X_df = X_df.reset_index(drop=True)
+    X_df["y"] = y_series
 
-    attack_df = X_df[X_df['y'] != benign_encoded_id]
-    benign_df = X_df[X_df['y'] == benign_encoded_id]
+    benign_id = broad_label_encoder.transform(["Benign"])[0]
 
-    print(f"  DEBUG (downsample): Length of attack_df after filtering: {len(attack_df)}")
-    print(f"  DEBUG (downsample): Length of benign_df after filtering: {len(benign_df)}")
+    attack_dfs = []
+    for int_lab in np.sort(X_df["y"].unique()):
+        if int_lab == benign_id:
+            continue
+        cls_df = X_df[X_df["y"] == int_lab]
+        n = len(cls_df)
+        
+        if n == 0: continue
 
-    # Calculate sample size for benign data
-    if len(attack_df) == 0:
-        print("  No attack samples found for downsampling. Returning original data.")
-        return X, y
+        if n > max_per_attack:
+            cls_df = cls_df.sample(n=max_per_attack, random_state=random_state)
+        elif n < min_per_attack:
+            extra = min_per_attack - n
+            add_df = cls_df.sample(n=extra, replace=True, random_state=random_state)
+            cls_df = pd.concat([cls_df, add_df], ignore_index=True)
+        
+        attack_dfs.append(cls_df)
+
+    attacks_df = pd.concat(attack_dfs, ignore_index=True) if attack_dfs else pd.DataFrame()
+    n_attacks = len(attacks_df)
+
+    benign_df = X_df[X_df["y"] == benign_id]
+    benign_target = int(benign_ratio * n_attacks)
     
-    sample_size = min(len(benign_df), int(len(attack_df) * ratio))
+    if benign_target > 0 and not benign_df.empty:
+        replace_benign = len(benign_df) < benign_target
+        benign_sample = benign_df.sample(n=benign_target, random_state=random_state, replace=replace_benign)
+        final_df = pd.concat([attacks_df, benign_sample], ignore_index=True)
+    else:
+        final_df = attacks_df.copy()
 
-    if sample_size == 0:
-        print("  Calculated benign sample size is 0. Returning only attack data.")
-        return attack_df.drop(columns=['y']).values, attack_df['y'].values
+    final_df = final_df.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
 
-    benign_sample = benign_df.sample(n=sample_size, random_state=random_state)
-
-    # Concatenate attack and sampled benign data
-    resampled_df = pd.concat([attack_df, benign_sample], ignore_index=True)
-
-    # Separate X and y, convert X back to NumPy array
-    X_resampled = resampled_df.drop(columns=['y']).values
-    y_resampled = resampled_df['y'].values
-
-    print(f"  Original data shape: {X.shape}")
-    print(f"  Attack samples: {len(attack_df)}, Benign samples (original): {len(benign_df)}")
-    print(f"  Benign samples (resampled): {len(benign_sample)}")
-    print(f"  Resampled data shape: {X_resampled.shape}")
-    print(f"  Resampled label distribution:\n{pd.Series(y_resampled).value_counts()}")
+    X_out = final_df.drop(columns=["y"]).values
+    y_out = final_df["y"].values
     
+    print(f"Rebalancing complete. New shape: {X_out.shape}")
+    print(f"Rebalanced label distribution:\n{pd.Series(y_out).value_counts().sort_index()}")
     gc.collect()
-    return X_resampled, y_resampled
+    return X_out, y_out
  
 
-def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset, label_encoder, ALL_ENCODED_LABELS, common_features,broad_label_mapper,broad_label_encoder,target_report_labels,force_retrain: bool = False):
+def run_cross_dataset_evaluation(
+        all_combined_dfs, 
+        all_individual_dfs_by_dataset, 
+        label_encoder, 
+        ALL_ENCODED_LABELS, 
+        common_features,
+        broad_label_mapper,
+        broad_label_encoder,
+        target_report_labels,
+        force_retrain: bool = False):
     """
     Performs cross-dataset generalization evaluation.
     Trains models on one dataset and tests on another, including hyperparameter optimization
@@ -150,15 +149,23 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
         ('CIC_IDS_2017', 'CIC_IDS_2018')
     ]
 
+
+
     base_models = {
        # 'Logistic Regression': LogisticRegression(random_state=42, n_jobs=-1),
-        #'Random Forest': RandomForestClassifier(random_state=42, n_jobs=-1),
-        'XGBoost': XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='mlogloss', n_jobs=-1)
+        #'Random Forest': RandomForestClassifier(random_state=42, n_jobs=-1,n_estimators=100),
+         'XGBoost': XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='mlogloss', n_jobs=-1)
+    }
+
+    REBALANCING_PARAMS = {
+        'CIC_IDS_2017': {'min_per_attack': 1500, 'max_per_attack': 150000, 'benign_ratio': 0.5},
+        'CIC_IDS_2018': {'min_per_attack': 50000, 'max_per_attack': 150000, 'benign_ratio': 1.0},
+        'default': {'min_per_attack': 5000, 'max_per_attack': 250000, 'benign_ratio': 0.5}
     }
     
     cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    # Use the SCORING_METRICS dictionary defined in utils/metrics_helpers.py
+    
     scoring_metrics = get_scoring_metrics(broad_label_encoder)
     refit_metric = 'f1_weighted_attack_only'
 
@@ -175,21 +182,18 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
         print(f"### SCENARIO: Training on {train_name} and Testing on {test_name} ###")
         print(f"################################################################################")
 
+
+        params_for_dataset = REBALANCING_PARAMS.get(train_name, REBALANCING_PARAMS['default'])
+        print(f"Using rebalancing parameters for {train_name}: {params_for_dataset}")
+
+
         # Prepare training and testing data for the current scenario  
         X_train_scenario_df = all_combined_dfs[train_name].drop(['Label', 'BroadLabel'], axis=1)
         y_train_scenario_broad = all_combined_dfs[train_name]['BroadLabel']
-        
-        
         X_test_scenario_combined_df = all_combined_dfs[test_name].drop(['Label', 'BroadLabel'], axis=1)
         y_test_scenario_combined_broad = all_combined_dfs[test_name]['BroadLabel']
 
-        # NEW: Convert numerical columns to float32 (if not already) and ensure consistent dtypes
-        # This part is included for robustness, even if parquet already optimizes
-        # print("Converting numerical columns to float32 for scenario data...")
-        # for df in [X_train_scenario_df, X_test_scenario_combined_df]:
-        #     for col in df.select_dtypes(include=np.number).columns:
-        #         df[col] = df[col].astype(np.float32)
-        # gc.collect()
+         
 
         print(f"X_train_scenario shape: {X_train_scenario_df.shape}, y_train_scenario_broad shape: {y_train_scenario_broad.shape}")
         print(f"X_test_scenario_combined shape: {X_test_scenario_combined_df.shape}, y_test_scenario_combined_broad shape: {y_test_scenario_combined_broad.shape}")
@@ -211,12 +215,11 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
         X_train_scenario_scaled = X_train_scenario_df.copy()
         X_train_scenario_scaled[numerical_cols_for_scaling] = scaler.transform(X_train_scenario_df[numerical_cols_for_scaling])
         
-
         # Convert to NumPy array for consistent input to models
         X_train_scenario_scaled_np = X_train_scenario_scaled.values
 
         # Free up memory from original DataFrames
-        del X_train_scenario_df, X_train_scenario_scaled
+        del X_train_scenario_df, 
         gc.collect()
 
         print("Z-score normalization complete for scenario.")
@@ -227,24 +230,22 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
 
 
         # Create a subsample of the training data for HPO (to manage memory)
-        hpo_sample_size = 1000000 # Example: 500,000 rows for HPO
-
-        X_train_scenario_hpo_source = X_train_scenario_scaled_np # Source for HPO subsample
-        y_train_scenario_hpo_source = y_train_scenario_broad # Source for HPO subsample
+        hpo_sample_size = 800000 # Example: 500,000 rows for HPO
+ 
 
         # NEW DEBUG PRINT: Directly before the train_test_split call
         print(f"\nDEBUG: y_hpo_base value_counts IMMEDIATELY BEFORE HPO subsampling train_test_split:")
-        print(y_train_scenario_hpo_source.value_counts())
-        print(f"DEBUG: y_hpo_base unique values IMMEDIATELY BEFORE HPO subsampling train_test_split: {np.unique(y_train_scenario_hpo_source).tolist()}")
-        print(f"DEBUG: y_hpo_base total length: {len(y_train_scenario_hpo_source)}")
+        print(y_train_scenario_broad.value_counts())
+        print(f"DEBUG: y_hpo_base unique values IMMEDIATELY BEFORE HPO subsampling train_test_split: {np.unique(y_train_scenario_broad).tolist()}")
+        print(f"DEBUG: y_hpo_base total length: {len(y_train_scenario_broad)}")
         print(f"DEBUG: Requested hpo_sample_size: {hpo_sample_size}")
         # END NEW DEBUG PRINT
         
-        if len(X_train_scenario_hpo_source) > hpo_sample_size:
+        if len(X_train_scenario_scaled_np) > hpo_sample_size:
             print(f"\nSubsampling training data for HPO to {hpo_sample_size} rows...")
             X_train_scenario_scaled_hpo, _, y_train_scenario_broad_hpo, _ = train_test_split(
-                X_train_scenario_hpo_source, y_train_scenario_hpo_source, # Use broad labels for HPO subsample
-                train_size=hpo_sample_size, stratify=y_train_scenario_hpo_source, random_state=42
+                X_train_scenario_scaled_np, y_train_scenario_broad, # Use broad labels for HPO subsample
+                train_size=hpo_sample_size, stratify=y_train_scenario_broad, random_state=42
             )
             print(f"DEBUG: y_train_scenario_broad_hpo distribution *AFTER* train_test_split:")
             print(pd.Series(y_train_scenario_broad_hpo).value_counts())
@@ -252,21 +253,13 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
             print(f"DEBUG: y_train_scenario_broad_hpo length *AFTER* train_test_split: {len(y_train_scenario_broad_hpo)}")
             
         else:
-            X_train_scenario_scaled_hpo = X_train_scenario_hpo_source
-            y_train_scenario_broad_hpo = y_train_scenario_hpo_source
+            X_train_scenario_scaled_hpo, y_train_scenario_broad_hpo = X_train_scenario_scaled_np, y_train_scenario_broad
             print("Training data size is small enough, no subsampling for HPO.")
 
-        # NEW: Apply Benign Downsampling to the HPO subsample
-        DOWNSAMPLE_BENIGN_RATIO_HPO = 1.0 # Example: 1:1 ratio of attack to benign for HPO
-        X_train_scenario_scaled_hpo, y_train_scenario_broad_hpo = downsample_benign_data(
-            X_train_scenario_scaled_hpo,
-            y_train_scenario_broad_hpo,
-            broad_label_encoder,
-            ratio=DOWNSAMPLE_BENIGN_RATIO_HPO
-        )
+        
+        
 
-        print(f"HPO subsample shape after downsampling: {X_train_scenario_scaled_hpo.shape}")
-
+ 
         #--- ADD THESE DEBUG PRINTS ---
         print(f"DEBUG: y_train_scenario_broad_hpo dtype: {y_train_scenario_broad_hpo.dtype}")
         print(f"DEBUG: y_train_scenario_broad_hpo unique values: {np.unique(y_train_scenario_broad_hpo).tolist()}")
@@ -279,22 +272,6 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
         # --- END DEBUG PRINTS ---
 
 
-        # NEW: Calculate sample weights for imbalanced data (based on combined training data)
-        print("\nCalculating sample weights for imbalanced broad labels in training data...")
-        if len(np.unique(y_train_scenario_broad_hpo)) < 2:
-            print(f"Skipping model training for this scenario: Only one class present in HPO subsample. Cannot calculate class weights or perform multi-class classification.")
-            all_scenario_results[f"Train_{train_name}_Test_{test_name}"] = {"Error": "Single Class in HPO Subsample"}
-            continue
-
-        classes_in_hpo_train = np.unique(y_train_scenario_broad_hpo)
-        class_weights_array = compute_class_weight(
-            'balanced',
-            classes=classes_in_hpo_train,
-            y=y_train_scenario_broad_hpo
-        )
-        class_weights_dict = dict(zip(classes_in_hpo_train, class_weights_array))
-        sample_weights_hpo = np.array([class_weights_dict[label] for label in y_train_scenario_broad_hpo])
-        print("Sample weights calculated for training data.")
 
 
         scenario_results = {}
@@ -310,6 +287,7 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
 
         # Hyperparameter Optimization and Model Training/Evaluation
         for model_name, base_model in base_models.items():
+            model_start_time = time.time()
             model_path = os.path.join(scenario_model_dir, f"{model_name}.joblib")
             model_results_path = os.path.join(scenario_results_dir, f"{model_name}_metrics.joblib")
 
@@ -317,7 +295,7 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
 
 
             # NEW: Check if model and results are already saved
-            if os.path.exists(model_path) and os.path.exists(model_results_path) and not force_retrain:
+            if os.path.exists(model_path)  and not force_retrain:
                 print(f"Loading saved model and results for {model_name} from {scenario_key_str}...")
                 best_model = joblib.load(model_path)
                 loaded_model_results = joblib.load(model_results_path)
@@ -330,13 +308,12 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
             print(f"\n--- Hyperparameter Optimization for {model_name} (Training on {train_name}) ---")
             param_grid = PARAM_GRIDS[model_name] # Use PARAM_GRIDS from constants
 
-            search_start_time = time.time()
+             
 
             # MODIFIED: Use RandomizedSearchCV for all models
-            search_class = RandomizedSearchCV
             n_iter_for_search = 20 # Default n_iter for RandomizedSearchCV (adjust as needed)
 
-            search = search_class(
+            search = RandomizedSearchCV(
                 estimator=base_model,
                 param_distributions=param_grid,
                 n_iter=n_iter_for_search,
@@ -344,21 +321,33 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
                 refit=refit_metric,
                 cv=cv_strategy,
                 n_jobs=-1,
-                verbose=2
+                verbose=2,
+                random_state=42 # CRITICAL FIX: Ensures reproducible HPO results.
             )
+
+            print("\n1. Rebalancing HPO data subset for speed...")
+            X_train_hpo_bal, y_train_hpo_bal = rebalance_attacks(
+                X_train_scenario_scaled_hpo, y_train_scenario_broad_hpo, broad_label_encoder,
+                min_per_attack=2000,max_per_attack=50000,benign_ratio=1.0
+            )
+            print("DEBUG scoring keys:", list(scoring_metrics.keys()))
+            print("DEBUG refit_metric:", refit_metric)
+
+            for train_idx, val_idx in cv_strategy.split(X_train_hpo_bal, y_train_hpo_bal):
+                # Check what attack classes appear in this fold
+                unique_classes = np.unique(y_train_hpo_bal[val_idx])
+                print("Validation fold attack classes:", unique_classes)
+
 
 
             # MODIFIED: Pass sample_weight to GridSearchCV's fit method
-            search.fit(X_train_scenario_scaled_hpo, y_train_scenario_broad_hpo, sample_weight=sample_weights_hpo)
-            results_df = pd.DataFrame(search.cv_results_)
-            print(results_df[['param_subsample', 'param_n_estimators', 'param_max_depth', 'param_learning_rate', 'param_colsample_bytree', 'mean_test_f1_weighted_attack_only', 'std_test_f1_weighted_attack_only']].sort_values(by='mean_test_f1_weighted_attack_only', ascending=False))
-
-
-
+            search.fit(X_train_hpo_bal, y_train_hpo_bal)
+            
             search_end_time = time.time()
-            search_duration = search_end_time - search_start_time
+            search_duration = search_end_time - model_start_time
+            minutes, seconds = divmod(search_duration, 60)
 
-            print(f"Hyperparameter optimization for {model_name} completed in {search_duration:.2f} seconds.")
+            print(f"Hyperparameter optimization for {model_name} completed in {int(minutes)} minutes and {int(seconds)} seconds ---")
             print(f"Best parameters for {model_name}: {search.best_params_}")
             print(f"Best cross-validation score ({refit_metric}) for {model_name}: {search.best_score_:.4f}")
 
@@ -391,30 +380,40 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
             # --- END NEW CHECK ---
 
 
-
-            # NEW: Apply Benign Downsampling to the FULL training data before final model fit
-            # This is crucial because the best_model from HPO is refitted on the full training data.
-            DOWNSAMPLE_BENIGN_RATIO_FINAL_TRAIN = 1.0 # Example: 1:1 ratio for final model training
-            X_final_train_scenario, y_final_train_scenario = downsample_benign_data(
-                X_train_scenario_hpo_source, # Use the full scaled training data (before HPO subsampling)
-                y_train_scenario_broad, # Use the full training labels
-                broad_label_encoder,
-                ratio=DOWNSAMPLE_BENIGN_RATIO_FINAL_TRAIN
+            # --- FINAL, CONDITIONAL TRAINING STRATEGY ---
+            print("\n2. Applying dataset-specific final training strategy...")
+            X_train_final_bal, y_train_final_bal = rebalance_attacks(
+                X_train_scenario_scaled_np, y_train_scenario_broad, broad_label_encoder,
+                min_per_attack=params_for_dataset['min_per_attack'],
+                max_per_attack=params_for_dataset['max_per_attack'],
+                benign_ratio=params_for_dataset['benign_ratio']
             )
-            
-            print(f"Final training data shape after downsampling: {X_final_train_scenario.shape}")
-                
-            # Refit the best model on the downsampled full training data
-            # This ensures the model used for overall and per-day evaluation is trained on downsampled data
-            final_model_sample_weights = np.array([class_weights_dict[label] for label in y_final_train_scenario])
-            
-            # Check if the model has a 'fit' method and refit it
-            if hasattr(best_model, 'fit'):
-                print(f"Refitting {model_name} on downsampled full training data...")
-                best_model.fit(X_final_train_scenario, y_final_train_scenario, sample_weight=final_model_sample_weights)
-                print("Refitting complete.")
+
+            # ** THE CRITICAL CHANGE IS HERE **
+            if train_name == 'CIC_IDS_2018':
+                # For 2018 (no rare classes), physical rebalancing is SUFFICIENT. Do NOT use weights.
+                print(f"\n3. Refitting {model_name} for {train_name} using physical rebalancing ONLY.")
+                best_model.fit(X_train_final_bal, y_train_final_bal)
             else:
-                print(f"Warning: {model_name} does not have a 'fit' method. Skipping refitting on downsampled data.")
+                # For 2017 (and default), use the HYBRID approach for the rare classes.
+                print(f"\n3. Refitting {model_name} for {train_name} using HYBRID approach (rebalancing + weights).")
+                classes_final = np.unique(y_train_final_bal)
+                class_weights_final = compute_class_weight('balanced', classes=classes_final, y=y_train_final_bal)
+                class_weights_dict_final = dict(zip(classes_final, class_weights_final))
+                final_model_sample_weights = np.array([class_weights_dict_final[label] for label in y_train_final_bal])
+                
+                print(f"\n4. Refitting {model_name} for {train_name} using HYBRID approach (rebalancing + weights).")
+                best_model.fit(X_train_final_bal, y_train_final_bal, sample_weight=final_model_sample_weights)
+
+            # --- Overall Evaluation on Combined Test Set ---
+            # This section runs for both loaded and newly trained models
+            # Get the model to use for evaluation (either loaded or newly trained)
+            model_for_eval = best_model # Use the best_model that was just trained/refitted
+
+            del X_train_final_bal, y_train_final_bal
+            gc.collect()
+
+
 
             # Store overall metrics for the generalizable model
             scenario_results[model_name] = {
@@ -652,7 +651,7 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
                 # Calculate per-day metrics
                 if len(np.unique(y_day_broad)) < 2:
                     print(f"  Warning: ROC AUC undefined for {day_name} (only one class in true labels).")
-                    day_metrics = {"Error": "Single Class in Day Data"}
+                    day_metrics = {"Error": " vDay Data"}
                 else:
                     day_accuracy = accuracy_score(y_day_broad, y_pred_day)
                     day_precision = precision_score(y_day_broad, y_pred_day, average='weighted', zero_division=0)
@@ -697,17 +696,6 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
                         print(f"  Warning: Could not calculate ROC AUC for {day_name}. Error: {e}")
                     except Exception as e:
                         print(f"  Warning: Unexpected error calculating ROC AUC for {day_name}. Error: {e}")
-
-
-                # Remove redundant print(classification_report(...))
-                # print(f"  Accuracy: {day_accuracy:.4f}")
-                # print(f"  Precision (weighted): {day_precision:.4f}")
-                # print(f"  Recall (weighted): {day_recall:.4f}")
-                # print(f"  F1-Score (weighted): {day_f1:.4f}")
-                # print(f"  Balanced Accuracy: {day_balanced_accuracy:.4f}")
-                # print(f"  Specificity (avg): {day_specificity:.4f}")
-                # print(f"  ROC AUC (weighted): {day_roc_auc:.4f}")
-                # print(f"\n  Per-Class Report for {day_name}:")
                 
                 # Extract specific attack class metrics for this day
                 day_clf_report_dict = classification_report(
@@ -721,13 +709,33 @@ def run_cross_dataset_evaluation(all_combined_dfs, all_individual_dfs_by_dataset
                 
                 # Extract specific attack class metrics for this day
                 specific_day_metrics = {}
+                # Compute confusion matrix once for the day
+                cm = confusion_matrix(y_day_broad, y_pred_day, labels=np.arange(len(broad_label_encoder.classes_)))
+
                 for target_str_label in target_report_labels:
                     if target_str_label in day_clf_report_dict:
+                        class_idx = broad_label_encoder.transform([target_str_label])[0]
+
+                        # Extract confusion matrix values for this class (one-vs-rest)
+                        TP = cm[class_idx, class_idx]
+                        FN = cm[class_idx, :].sum() - TP
+                        FP = cm[:, class_idx].sum() - TP
+                        TN = cm.sum() - (TP + FP + FN)
+
+                        recall = day_clf_report_dict[target_str_label]['recall']
+                        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+                        balanced_acc = 0.5 * (recall + specificity)
+
+                        support = day_clf_report_dict[target_str_label]['support']
+                        if support == 0:
+                            continue  # Skip attacks with no samples in this day
+
                         specific_day_metrics[target_str_label] = {
                             'Precision': day_clf_report_dict[target_str_label]['precision'],
                             'Recall': day_clf_report_dict[target_str_label]['recall'],
                             'F1-Score': day_clf_report_dict[target_str_label]['f1-score'],
-                            'Support': day_clf_report_dict[target_str_label]['support']
+                            'Support': support,
+                            'Balanced Accuracy': balanced_acc
                         }
                     else:
                         specific_day_metrics[target_str_label] = {
